@@ -6,7 +6,7 @@ EXPORT_DIR="$BASE_DIR/exports"
 BACKUP_DIR="$BASE_DIR/backups"
 BIN_PATH="/usr/local/bin/mtproxy-manager"
 IMAGE="telegrammessenger/proxy:latest"
-VERSION="v2.9-stable"
+VERSION="v3.0-fast"
 SCRIPT_URL="https://raw.githubusercontent.com/Ale8045/telegram-mtproxy/main/mtproxy.sh"
 
 red(){ echo -e "\033[31m$1\033[0m"; }
@@ -630,8 +630,6 @@ show_node(){
   REQ_ID="$1"
 
   load_node "$REQ_ID" || return
-  check_nodes >/dev/null 2>&1 || true
-  load_node "$REQ_ID" || return
 
   EXPIRE_DATE=$(format_date "$EXPIRE_AT")
   LEFT=$(days_left "$EXPIRE_AT")
@@ -1226,7 +1224,6 @@ dashboard_counts(){
 }
 
 menu(){
-  check_nodes >/dev/null 2>&1 || true
   dashboard_counts
 
   clear
@@ -1256,7 +1253,7 @@ menu(){
     1) create_node; pause ;;
     2) batch_create_nodes; pause ;;
     3) check_nodes; list_nodes; pause ;;
-    4) check_nodes; show_one_node; pause ;;
+    4) show_one_node; pause ;;
     5) edit_customer; pause ;;
     6) edit_expire; pause ;;
     7) edit_limit; pause ;;
