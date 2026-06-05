@@ -2,24 +2,48 @@
 
 BASE_DIR="/opt/mtproxy"
 NODE_DIR="$BASE_DIR/nodes"
+EXPORT_DIR="$BASE_DIR/exports"
+BACKUP_DIR="$BASE_DIR/backups"
 BIN_PATH="/usr/local/bin/mtproxy-manager"
 IMAGE="telegrammessenger/proxy:latest"
+VERSION="v2.0"
 
 red(){ echo -e "\033[31m$1\033[0m"; }
 green(){ echo -e "\033[32m$1\033[0m"; }
 yellow(){ echo -e "\033[33m$1\033[0m"; }
+blue(){ echo -e "\033[36m$1\033[0m"; }
+
+pause(){
+  echo
+  read -rp "按回车返回菜单..."
+}
 
 check_root(){
-  [ "$EUID" -ne 0 ] && red "请使用 root 运行" && exit 1
+  if [ "$EUID" -ne 0 ]; then
+    red "请使用 root 运行"
+    exit 1
+  fi
+}
+
+safe_value(){
+  echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
 get_ip(){
   curl -4 -s https://api.ipify.org || curl -4 -s https://ifconfig.me || hostname -I | awk '{print $1}'
 }
 
+ensure_dirs(){
+  mkdir -p "$BASE_DIR" "$NODE_DIR" "$EXPORT_DIR" "$BACKUP_DIR"
+}
+
+node_file(){
+  echo "$NODE_DIR/node-$1.conf"
+}
+
 fix_debian_sources(){
   [ ! -f /etc/debian_version ] && return
-  VER=$(grep -oE '^[0-9]+' /etc/debian_version)
+  VER=$(grep -oE '^[0-9]+' /etc/debian_version 2>/dev/null || true)
 
   if [ "$VER" = "11" ]; then
     cat > /etc/apt/sources.list <<'EOF'
@@ -35,32 +59,34 @@ deb http://security.debian.org/debian-security bookworm-security main contrib no
 EOF
   fi
 
-  rm -f /etc/apt/sources.list.d/xanmod*.list 2>/dev/null
+  rm -f /etc/apt/sources.list.d/xanmod*.list 2>/dev/null || true
 }
 
 install_base(){
+  ensure_dirs
+
   apt update || {
-    yellow "APT 源异常，正在修复..."
+    yellow "APT 源异常，正在尝试修复..."
     fix_debian_sources
     apt clean
     apt update
   }
 
-  apt install -y curl ca-certificates openssl cron ufw
+  apt install -y curl ca-certificates openssl cron ufw iproute2 coreutils
 }
 
 install_docker(){
   if command -v docker >/dev/null 2>&1; then
     green "Docker 已安装"
-    systemctl enable docker >/dev/null 2>&1
-    systemctl start docker >/dev/null 2>&1
+    systemctl enable docker >/dev/null 2>&1 || true
+    systemctl start docker >/dev/null 2>&1 || true
     return
   fi
 
   yellow "正在安装 Docker..."
   curl -fsSL https://get.docker.com | bash
-  systemctl enable docker
-  systemctl start docker
+  systemctl enable docker >/dev/null 2>&1 || true
+  systemctl start docker >/dev/null 2>&1 || true
 }
 
 enable_bbr(){
@@ -68,16 +94,46 @@ enable_bbr(){
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
-  sysctl --system >/dev/null 2>&1
+  sysctl --system >/dev/null 2>&1 || true
 }
 
 open_firewall(){
   PORT="$1"
-  ufw allow "$PORT"/tcp >/dev/null 2>&1
+  ufw allow "$PORT"/tcp >/dev/null 2>&1 || true
+
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port="$PORT"/tcp >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+}
+
+install_cron(){
+  ensure_dirs
+
+  if [ -f "$0" ]; then
+    cp "$0" "$BIN_PATH"
+    chmod +x "$BIN_PATH"
+  fi
+
+  systemctl enable cron >/dev/null 2>&1 || true
+  systemctl start cron >/dev/null 2>&1 || true
+
+  crontab -l 2>/dev/null | grep -v "mtproxy-manager --check" > /tmp/mtproxy_cron || true
+  echo "*/5 * * * * bash $BIN_PATH --check >/dev/null 2>&1" >> /tmp/mtproxy_cron
+  crontab /tmp/mtproxy_cron
+  rm -f /tmp/mtproxy_cron
+}
+
+prepare_env(){
+  check_root
+  install_base
+  install_docker
+  enable_bbr
+  install_cron
 }
 
 next_id(){
-  mkdir -p "$NODE_DIR"
+  ensure_dirs
   if ls "$NODE_DIR"/node-*.conf >/dev/null 2>&1; then
     ls "$NODE_DIR"/node-*.conf | sed 's/.*node-\([0-9]*\).conf/\1/' | sort -n | tail -1 | awk '{print $1+1}'
   else
@@ -85,23 +141,50 @@ next_id(){
   fi
 }
 
+port_in_use(){
+  ss -lnt 2>/dev/null | awk '{print $4}' | grep -q ":$1$"
+}
+
 random_port(){
   while true; do
     P=$(shuf -i 20000-60000 -n 1)
-    ss -lnt | awk '{print $4}' | grep -q ":$P$" || { echo "$P"; return; }
+    port_in_use "$P" || { echo "$P"; return; }
   done
 }
 
+normalize_status(){
+  case "$1" in
+    active|ACTIVE) echo "ACTIVE" ;;
+    expired|EXPIRED) echo "EXPIRED" ;;
+    limited|LIMITED) echo "LIMITED" ;;
+    manual|MANUAL|stopped|STOPPED) echo "MANUAL" ;;
+    *) echo "ACTIVE" ;;
+  esac
+}
+
+status_cn(){
+  case "$1" in
+    ACTIVE) echo "在线" ;;
+    EXPIRED) echo "到期暂停" ;;
+    LIMITED) echo "流量暂停" ;;
+    MANUAL) echo "手动暂停" ;;
+    *) echo "$1" ;;
+  esac
+}
+
 to_bytes(){
-  NUM=$(echo "$1" | grep -oE '^[0-9.]+')
-  UNIT=$(echo "$1" | grep -oE '[A-Za-z]+$')
+  RAW="$1"
+  NUM=$(echo "$RAW" | grep -oE '^[0-9.]+')
+  UNIT=$(echo "$RAW" | grep -oE '[A-Za-z]+$')
+
+  [ -z "$NUM" ] && echo 0 && return
 
   awk -v n="$NUM" -v u="$UNIT" 'BEGIN{
     if(u=="B") m=1;
-    else if(u=="kB"||u=="KB") m=1024;
-    else if(u=="MB") m=1024*1024;
-    else if(u=="GB") m=1024*1024*1024;
-    else if(u=="TB") m=1024*1024*1024*1024;
+    else if(u=="kB"||u=="KB"||u=="KiB") m=1024;
+    else if(u=="MB"||u=="MiB") m=1024*1024;
+    else if(u=="GB"||u=="GiB") m=1024*1024*1024;
+    else if(u=="TB"||u=="TiB") m=1024*1024*1024*1024;
     else m=1;
     printf "%.0f", n*m
   }'
@@ -121,56 +204,95 @@ container_traffic(){
   echo $((INB + OUTB))
 }
 
-install_cron(){
-  mkdir -p "$BASE_DIR"
-  if [ -f "$0" ]; then
-    cp "$0" "$BIN_PATH"
-    chmod +x "$BIN_PATH"
-  fi
-
-  systemctl enable cron >/dev/null 2>&1
-  systemctl start cron >/dev/null 2>&1
-
-  crontab -l 2>/dev/null | grep -v "mtproxy-manager --check" > /tmp/mtproxy_cron
-  echo "*/5 * * * * bash $BIN_PATH --check >/dev/null 2>&1" >> /tmp/mtproxy_cron
-  crontab /tmp/mtproxy_cron
-  rm -f /tmp/mtproxy_cron
+gb_to_bytes(){
+  GB="$1"
+  awk -v g="$GB" 'BEGIN{printf "%.0f", g*1024*1024*1024}'
 }
 
-create_node(){
-  check_root
-  install_base
-  install_docker
-  enable_bbr
-  install_cron
+bytes_to_gb(){
+  B="${1:-0}"
+  awk -v b="$B" 'BEGIN{printf "%.2f", b/1024/1024/1024}'
+}
 
-  ID=$(next_id)
-  NAME="mtproxy-node-$ID"
-
-  read -rp "端口：1 自动随机 / 2 手动输入 [默认 1]: " PORT_MODE
-  PORT_MODE=${PORT_MODE:-1}
-
-  if [ "$PORT_MODE" = "2" ]; then
-    read -rp "请输入端口: " PORT
+days_left(){
+  EXPIRE="$1"
+  NOW=$(date +%s)
+  LEFT=$(( (EXPIRE - NOW) / 86400 ))
+  if [ "$LEFT" -lt 0 ]; then
+    echo 0
   else
-    PORT=$(random_port)
+    echo "$LEFT"
   fi
+}
 
-  read -rp "到期天数 [默认 30]: " DAYS
-  DAYS=${DAYS:-30}
+format_date(){
+  date -d "@$1" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "-"
+}
 
-  read -rp "流量限制 GB [默认 50]: " LIMIT_GB
-  LIMIT_GB=${LIMIT_GB:-50}
+load_node(){
+  ID="$1"
+  FILE=$(node_file "$ID")
+  [ ! -f "$FILE" ] && red "节点不存在" && return 1
+  . "$FILE"
 
-  read -rp "频道 TAG，没有就回车: " TAG
+  CUSTOMER="${CUSTOMER:-未填写}"
+  TG_USER="${TG_USER:-未填写}"
+  REMARK="${REMARK:-}"
+  TAG="${TAG:-}"
+  STATUS=$(normalize_status "${STATUS:-ACTIVE}")
+  USED_BYTES="${USED_BYTES:-0}"
+  LAST_BYTES="${LAST_BYTES:-0}"
+  LIMIT_GB="${LIMIT_GB:-50}"
+  LIMIT_BYTES="${LIMIT_BYTES:-$(gb_to_bytes "$LIMIT_GB")}"
+  CREATED_AT="${CREATED_AT:-$(date +%s)}"
+  EXPIRE_AT="${EXPIRE_AT:-$((CREATED_AT + 30*86400))}"
+  IP="${IP:-$(get_ip)}"
+  return 0
+}
 
-  SECRET=$(openssl rand -hex 16)
-  IP=$(get_ip)
-  CREATED_AT=$(date +%s)
-  EXPIRE_AT=$((CREATED_AT + DAYS * 86400))
-  LIMIT_BYTES=$((LIMIT_GB * 1024 * 1024 * 1024))
+save_node(){
+  ensure_dirs
+  FILE=$(node_file "$ID")
 
-  docker rm -f "$NAME" >/dev/null 2>&1
+  CUSTOMER_ESC=$(safe_value "${CUSTOMER:-未填写}")
+  TG_USER_ESC=$(safe_value "${TG_USER:-未填写}")
+  REMARK_ESC=$(safe_value "${REMARK:-}")
+  TAG_ESC=$(safe_value "${TAG:-}")
+
+  cat > "$FILE" <<EOF
+ID=$ID
+NAME="$NAME"
+CUSTOMER="$CUSTOMER_ESC"
+TG_USER="$TG_USER_ESC"
+REMARK="$REMARK_ESC"
+PORT=$PORT
+SECRET="$SECRET"
+IP="$IP"
+TAG="$TAG_ESC"
+CREATED_AT=$CREATED_AT
+EXPIRE_AT=$EXPIRE_AT
+LIMIT_GB=$LIMIT_GB
+LIMIT_BYTES=$LIMIT_BYTES
+USED_BYTES=$USED_BYTES
+LAST_BYTES=$LAST_BYTES
+STATUS=$STATUS
+EOF
+}
+
+proxy_link(){
+  IP_NOW=$(get_ip)
+  [ -n "$IP_NOW" ] && IP="$IP_NOW"
+  echo "tg://proxy?server=$IP&port=$PORT&secret=$SECRET"
+}
+
+web_link(){
+  IP_NOW=$(get_ip)
+  [ -n "$IP_NOW" ] && IP="$IP_NOW"
+  echo "https://t.me/proxy?server=$IP&port=$PORT&secret=$SECRET"
+}
+
+run_container(){
+  docker rm -f "$NAME" >/dev/null 2>&1 || true
 
   if [ -n "$TAG" ]; then
     docker run -d \
@@ -188,145 +310,189 @@ create_node(){
       -e SECRET="$SECRET" \
       "$IMAGE"
   fi
+}
 
+create_node_core(){
+  ID="$1"
+  NAME="mtproxy-node-$ID"
+
+  if [ "$PORT_MODE" = "2" ]; then
+    read -rp "请输入端口: " PORT
+  else
+    PORT=$(random_port)
+  fi
+
+  while port_in_use "$PORT"; do
+    yellow "端口 $PORT 已被占用"
+    read -rp "请重新输入端口，直接回车自动随机: " NEW_PORT
+    if [ -z "$NEW_PORT" ]; then
+      PORT=$(random_port)
+      break
+    else
+      PORT="$NEW_PORT"
+    fi
+  done
+
+  SECRET=$(openssl rand -hex 16)
+  IP=$(get_ip)
+  CREATED_AT=$(date +%s)
+  EXPIRE_AT=$((CREATED_AT + DAYS * 86400))
+  LIMIT_BYTES=$(gb_to_bytes "$LIMIT_GB")
+  USED_BYTES=0
+  LAST_BYTES=0
+  STATUS="ACTIVE"
+
+  run_container
   open_firewall "$PORT"
+  save_node
+}
 
-  mkdir -p "$NODE_DIR"
+create_node(){
+  prepare_env
 
-  cat > "$NODE_DIR/node-$ID.conf" <<EOF
-ID=$ID
-NAME=$NAME
-PORT=$PORT
-SECRET=$SECRET
-IP=$IP
-TAG=$TAG
-CREATED_AT=$CREATED_AT
-EXPIRE_AT=$EXPIRE_AT
-LIMIT_GB=$LIMIT_GB
-LIMIT_BYTES=$LIMIT_BYTES
-USED_BYTES=0
-LAST_BYTES=0
-STATUS=active
-EOF
+  ID=$(next_id)
+
+  read -rp "客户名称: " CUSTOMER
+  CUSTOMER=${CUSTOMER:-未填写}
+
+  read -rp "TG账号: " TG_USER
+  TG_USER=${TG_USER:-未填写}
+
+  read -rp "节点备注: " REMARK
+
+  read -rp "端口：1 自动随机 / 2 手动输入 [默认 1]: " PORT_MODE
+  PORT_MODE=${PORT_MODE:-1}
+
+  read -rp "到期天数 [默认 30]: " DAYS
+  DAYS=${DAYS:-30}
+
+  read -rp "流量限制 GB [默认 50]: " LIMIT_GB
+  LIMIT_GB=${LIMIT_GB:-50}
+
+  read -rp "频道 TAG，没有就回车: " TAG
+
+  create_node_core "$ID"
 
   green "创建成功"
   echo
   show_node "$ID"
 }
 
+batch_create_nodes(){
+  prepare_env
+
+  read -rp "批量创建数量: " COUNT
+  [ -z "$COUNT" ] && red "数量不能为空" && return
+
+  read -rp "统一到期天数 [默认 30]: " DAYS
+  DAYS=${DAYS:-30}
+
+  read -rp "统一流量限制 GB [默认 50]: " LIMIT_GB
+  LIMIT_GB=${LIMIT_GB:-50}
+
+  read -rp "频道 TAG，没有就回车: " TAG
+
+  read -rp "端口：1 自动随机 / 2 手动输入起始端口 [默认 1]: " PORT_MODE
+  PORT_MODE=${PORT_MODE:-1}
+
+  if [ "$PORT_MODE" = "2" ]; then
+    read -rp "请输入起始端口: " START_PORT
+  fi
+
+  for i in $(seq 1 "$COUNT"); do
+    ID=$(next_id)
+    CUSTOMER="客户-$ID"
+    TG_USER="未填写"
+    REMARK="批量创建"
+    NAME="mtproxy-node-$ID"
+
+    if [ "$PORT_MODE" = "2" ]; then
+      PORT=$((START_PORT + i - 1))
+      while port_in_use "$PORT"; do
+        PORT=$((PORT + 1))
+      done
+    else
+      PORT=$(random_port)
+    fi
+
+    SECRET=$(openssl rand -hex 16)
+    IP=$(get_ip)
+    CREATED_AT=$(date +%s)
+    EXPIRE_AT=$((CREATED_AT + DAYS * 86400))
+    LIMIT_BYTES=$(gb_to_bytes "$LIMIT_GB")
+    USED_BYTES=0
+    LAST_BYTES=0
+    STATUS="ACTIVE"
+
+    run_container
+    open_firewall "$PORT"
+    save_node
+
+    green "已创建节点 ID: $ID 端口: $PORT"
+  done
+}
+
 show_node(){
   ID="$1"
-  FILE="$NODE_DIR/node-$ID.conf"
+  load_node "$ID" || return
 
-  [ ! -f "$FILE" ] && red "节点不存在" && return
+  check_nodes >/dev/null 2>&1 || true
+  load_node "$ID" || return
 
-  . "$FILE"
-  IP_NOW=$(get_ip)
-  [ -n "$IP_NOW" ] && IP="$IP_NOW"
+  EXPIRE_DATE=$(format_date "$EXPIRE_AT")
+  LEFT=$(days_left "$EXPIRE_AT")
+  USED_GB=$(bytes_to_gb "$USED_BYTES")
+  STATUS_TEXT=$(status_cn "$STATUS")
 
-  EXPIRE_DATE=$(date -d "@$EXPIRE_AT" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
-  USED_GB=$(awk "BEGIN{printf \"%.2f\", $USED_BYTES/1024/1024/1024}")
-
-  echo "ID: $ID"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "节点详情"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "客户名称: $CUSTOMER"
+  echo "TG账号: $TG_USER"
+  echo "备注: $REMARK"
+  echo
+  echo "节点ID: $ID"
+  echo "容器: $NAME"
   echo "端口: $PORT"
-  echo "状态: $STATUS"
+  echo "状态: $STATUS / $STATUS_TEXT"
+  echo
   echo "已用流量: ${USED_GB}GB / ${LIMIT_GB}GB"
   echo "到期时间: $EXPIRE_DATE"
+  echo "剩余天数: ${LEFT}天"
   echo
   green "Telegram 链接："
-  echo "tg://proxy?server=$IP&port=$PORT&secret=$SECRET"
+  proxy_link
   echo
   green "网页链接："
-  echo "https://t.me/proxy?server=$IP&port=$PORT&secret=$SECRET"
+  web_link
+  echo
 }
 
 list_nodes(){
-  mkdir -p "$NODE_DIR"
+  ensure_dirs
 
   if ! ls "$NODE_DIR"/node-*.conf >/dev/null 2>&1; then
     red "暂无代理节点"
     return
   fi
 
-  printf "%-5s %-18s %-8s %-10s %-12s %-20s\n" "ID" "容器" "端口" "状态" "流量GB" "到期时间"
+  printf "%-5s %-14s %-16s %-8s %-10s %-14s %-8s\n" "ID" "客户" "TG账号" "端口" "状态" "流量GB" "剩余"
+  echo "----------------------------------------------------------------------------"
 
   for FILE in "$NODE_DIR"/node-*.conf; do
     . "$FILE"
-    EXPIRE_DATE=$(date -d "@$EXPIRE_AT" "+%Y-%m-%d")
-    USED_GB_NOW=$(awk "BEGIN{printf \"%.2f\", $USED_BYTES/1024/1024/1024}")
-    printf "%-5s %-18s %-8s %-10s %-12s %-20s\n" "$ID" "$NAME" "$PORT" "$STATUS" "$USED_GB_NOW/$LIMIT_GB" "$EXPIRE_DATE"
-  done
-}
+    STATUS=$(normalize_status "${STATUS:-ACTIVE}")
+    CUSTOMER="${CUSTOMER:-未填写}"
+    TG_USER="${TG_USER:-未填写}"
+    USED_BYTES="${USED_BYTES:-0}"
+    LIMIT_GB="${LIMIT_GB:-50}"
+    EXPIRE_AT="${EXPIRE_AT:-0}"
 
-delete_node(){
-  read -rp "请输入要删除的节点 ID: " ID
-  FILE="$NODE_DIR/node-$ID.conf"
+    USED_GB_NOW=$(bytes_to_gb "$USED_BYTES")
+    LEFT=$(days_left "$EXPIRE_AT")
 
-  [ ! -f "$FILE" ] && red "节点不存在" && return
-
-  . "$FILE"
-  docker rm -f "$NAME" >/dev/null 2>&1
-  rm -f "$FILE"
-
-  green "节点 $ID 已删除"
-}
-
-restart_node(){
-  read -rp "请输入要重启的节点 ID: " ID
-  FILE="$NODE_DIR/node-$ID.conf"
-
-  [ ! -f "$FILE" ] && red "节点不存在" && return
-
-  . "$FILE"
-  docker restart "$NAME"
-  green "节点 $ID 已重启"
-}
-
-check_nodes(){
-  mkdir -p "$NODE_DIR"
-  NOW=$(date +%s)
-
-  for FILE in "$NODE_DIR"/node-*.conf; do
-    [ ! -f "$FILE" ] && continue
-
-    . "$FILE"
-
-    [ "$STATUS" != "active" ] && continue
-
-    CURRENT_BYTES=$(container_traffic "$NAME")
-
-    if [ "$CURRENT_BYTES" -ge "$LAST_BYTES" ]; then
-      DELTA=$((CURRENT_BYTES - LAST_BYTES))
-    else
-      DELTA=$CURRENT_BYTES
-    fi
-
-    USED_BYTES=$((USED_BYTES + DELTA))
-    LAST_BYTES=$CURRENT_BYTES
-
-    if [ "$NOW" -ge "$EXPIRE_AT" ]; then
-      docker rm -f "$NAME" >/dev/null 2>&1
-      STATUS="expired"
-    elif [ "$USED_BYTES" -ge "$LIMIT_BYTES" ]; then
-      docker rm -f "$NAME" >/dev/null 2>&1
-      STATUS="limited"
-    fi
-
-    cat > "$FILE" <<EOF
-ID=$ID
-NAME=$NAME
-PORT=$PORT
-SECRET=$SECRET
-IP=$IP
-TAG=$TAG
-CREATED_AT=$CREATED_AT
-EXPIRE_AT=$EXPIRE_AT
-LIMIT_GB=$LIMIT_GB
-LIMIT_BYTES=$LIMIT_BYTES
-USED_BYTES=$USED_BYTES
-LAST_BYTES=$LAST_BYTES
-STATUS=$STATUS
-EOF
+    printf "%-5s %-14s %-16s %-8s %-10s %-14s %-8s\n" \
+      "$ID" "$CUSTOMER" "$TG_USER" "$PORT" "$STATUS" "$USED_GB_NOW/$LIMIT_GB" "${LEFT}天"
   done
 }
 
@@ -335,30 +501,458 @@ show_one_node(){
   show_node "$ID"
 }
 
+delete_node(){
+  read -rp "请输入要删除的节点 ID: " ID
+  load_node "$ID" || return
+
+  read -rp "确认删除节点 $ID？输入 yes 确认: " OK
+  [ "$OK" != "yes" ] && yellow "已取消" && return
+
+  docker rm -f "$NAME" >/dev/null 2>&1 || true
+  rm -f "$(node_file "$ID")"
+
+  green "节点 $ID 已删除"
+}
+
+restart_node(){
+  read -rp "请输入要重启的节点 ID: " ID
+  load_node "$ID" || return
+
+  docker restart "$NAME" >/dev/null 2>&1
+  green "节点 $ID 已重启"
+}
+
+disable_node(){
+  read -rp "请输入要停用的节点 ID: " ID
+  load_node "$ID" || return
+
+  docker stop "$NAME" >/dev/null 2>&1 || true
+  STATUS="MANUAL"
+  save_node
+
+  green "节点 $ID 已手动停用"
+}
+
+enable_node(){
+  read -rp "请输入要启用的节点 ID: " ID
+  load_node "$ID" || return
+
+  NOW=$(date +%s)
+  if [ "$NOW" -ge "$EXPIRE_AT" ]; then
+    red "节点已到期，请先修改到期时间或续费"
+    return
+  fi
+
+  if [ "$USED_BYTES" -ge "$LIMIT_BYTES" ]; then
+    red "节点流量已超限，请先修改流量限制或续费"
+    return
+  fi
+
+  if ! docker inspect "$NAME" >/dev/null 2>&1; then
+    yellow "容器不存在，正在重新创建..."
+    run_container
+  else
+    docker start "$NAME" >/dev/null 2>&1 || true
+  fi
+
+  STATUS="ACTIVE"
+  save_node
+
+  green "节点 $ID 已启用"
+}
+
+edit_customer(){
+  read -rp "请输入节点 ID: " ID
+  load_node "$ID" || return
+
+  echo "当前客户名称: $CUSTOMER"
+  read -rp "新客户名称，回车不改: " NEW_CUSTOMER
+
+  echo "当前TG账号: $TG_USER"
+  read -rp "新TG账号，回车不改: " NEW_TG
+
+  echo "当前备注: $REMARK"
+  read -rp "新备注，回车不改: " NEW_REMARK
+
+  [ -n "$NEW_CUSTOMER" ] && CUSTOMER="$NEW_CUSTOMER"
+  [ -n "$NEW_TG" ] && TG_USER="$NEW_TG"
+  [ -n "$NEW_REMARK" ] && REMARK="$NEW_REMARK"
+
+  save_node
+  green "客户信息已更新"
+}
+
+edit_expire(){
+  read -rp "请输入节点 ID: " ID
+  load_node "$ID" || return
+
+  echo "当前到期时间: $(format_date "$EXPIRE_AT")"
+  read -rp "设置新的到期天数，从今天开始计算: " DAYS
+  [ -z "$DAYS" ] && red "天数不能为空" && return
+
+  EXPIRE_AT=$(($(date +%s) + DAYS * 86400))
+
+  if [ "$STATUS" = "EXPIRED" ]; then
+    if [ "$USED_BYTES" -lt "$LIMIT_BYTES" ]; then
+      docker start "$NAME" >/dev/null 2>&1 || true
+      STATUS="ACTIVE"
+    fi
+  fi
+
+  save_node
+  green "到期时间已更新"
+}
+
+edit_limit(){
+  read -rp "请输入节点 ID: " ID
+  load_node "$ID" || return
+
+  echo "当前流量限制: ${LIMIT_GB}GB"
+  read -rp "新的流量限制 GB: " NEW_LIMIT_GB
+  [ -z "$NEW_LIMIT_GB" ] && red "流量不能为空" && return
+
+  LIMIT_GB="$NEW_LIMIT_GB"
+  LIMIT_BYTES=$(gb_to_bytes "$LIMIT_GB")
+
+  NOW=$(date +%s)
+  if [ "$STATUS" = "LIMITED" ] && [ "$USED_BYTES" -lt "$LIMIT_BYTES" ] && [ "$NOW" -lt "$EXPIRE_AT" ]; then
+    docker start "$NAME" >/dev/null 2>&1 || true
+    STATUS="ACTIVE"
+  fi
+
+  save_node
+  green "流量限制已更新"
+}
+
+renew_node(){
+  read -rp "请输入节点 ID: " ID
+  load_node "$ID" || return
+
+  read -rp "增加天数 [默认 30]: " ADD_DAYS
+  ADD_DAYS=${ADD_DAYS:-30}
+
+  read -rp "增加流量 GB [默认 50]: " ADD_GB
+  ADD_GB=${ADD_GB:-50}
+
+  NOW=$(date +%s)
+
+  if [ "$EXPIRE_AT" -lt "$NOW" ]; then
+    EXPIRE_AT=$((NOW + ADD_DAYS * 86400))
+  else
+    EXPIRE_AT=$((EXPIRE_AT + ADD_DAYS * 86400))
+  fi
+
+  LIMIT_GB=$(awk -v a="$LIMIT_GB" -v b="$ADD_GB" 'BEGIN{printf "%.2f", a+b}')
+  LIMIT_BYTES=$(gb_to_bytes "$LIMIT_GB")
+
+  if [ "$USED_BYTES" -lt "$LIMIT_BYTES" ] && [ "$NOW" -lt "$EXPIRE_AT" ]; then
+    if ! docker inspect "$NAME" >/dev/null 2>&1; then
+      run_container
+    else
+      docker start "$NAME" >/dev/null 2>&1 || true
+    fi
+    STATUS="ACTIVE"
+  fi
+
+  save_node
+  green "续费成功"
+  show_node "$ID"
+}
+
+search_customer(){
+  read -rp "请输入客户名称 / TG账号 / 备注关键词: " KW
+  [ -z "$KW" ] && return
+
+  echo
+  printf "%-5s %-14s %-16s %-8s %-10s %-14s\n" "ID" "客户" "TG账号" "端口" "状态" "备注"
+  echo "----------------------------------------------------------------------------"
+
+  FOUND=0
+  for FILE in "$NODE_DIR"/node-*.conf; do
+    [ ! -f "$FILE" ] && continue
+    . "$FILE"
+    CUSTOMER="${CUSTOMER:-未填写}"
+    TG_USER="${TG_USER:-未填写}"
+    REMARK="${REMARK:-}"
+    STATUS=$(normalize_status "${STATUS:-ACTIVE}")
+
+    if echo "$CUSTOMER $TG_USER $REMARK $ID $PORT" | grep -qi "$KW"; then
+      printf "%-5s %-14s %-16s %-8s %-10s %-14s\n" "$ID" "$CUSTOMER" "$TG_USER" "$PORT" "$STATUS" "$REMARK"
+      FOUND=1
+    fi
+  done
+
+  [ "$FOUND" = "0" ] && red "没有找到匹配节点"
+}
+
+expiring_nodes(){
+  read -rp "显示几天内到期 [默认 7]: " WARN_DAYS
+  WARN_DAYS=${WARN_DAYS:-7}
+  NOW=$(date +%s)
+  LIMIT_TIME=$((NOW + WARN_DAYS * 86400))
+
+  echo
+  yellow "即将到期客户（${WARN_DAYS}天内）"
+  printf "%-5s %-14s %-16s %-8s %-10s %-12s\n" "ID" "客户" "TG账号" "端口" "状态" "剩余"
+  echo "----------------------------------------------------------------------------"
+
+  FOUND=0
+  for FILE in "$NODE_DIR"/node-*.conf; do
+    [ ! -f "$FILE" ] && continue
+    . "$FILE"
+    STATUS=$(normalize_status "${STATUS:-ACTIVE}")
+    CUSTOMER="${CUSTOMER:-未填写}"
+    TG_USER="${TG_USER:-未填写}"
+
+    if [ "$EXPIRE_AT" -le "$LIMIT_TIME" ]; then
+      LEFT=$(days_left "$EXPIRE_AT")
+      printf "%-5s %-14s %-16s %-8s %-10s %-12s\n" "$ID" "$CUSTOMER" "$TG_USER" "$PORT" "$STATUS" "${LEFT}天"
+      FOUND=1
+    fi
+  done
+
+  [ "$FOUND" = "0" ] && green "没有即将到期客户"
+}
+
+export_links(){
+  ensure_dirs
+  OUT="$EXPORT_DIR/all_links.txt"
+  : > "$OUT"
+
+  for FILE in "$NODE_DIR"/node-*.conf; do
+    [ ! -f "$FILE" ] && continue
+    . "$FILE"
+    CUSTOMER="${CUSTOMER:-未填写}"
+    TG_USER="${TG_USER:-未填写}"
+    REMARK="${REMARK:-}"
+    STATUS=$(normalize_status "${STATUS:-ACTIVE}")
+    IP_NOW=$(get_ip)
+    [ -n "$IP_NOW" ] && IP="$IP_NOW"
+
+    {
+      echo "客户：$CUSTOMER"
+      echo "TG：$TG_USER"
+      echo "备注：$REMARK"
+      echo "状态：$STATUS"
+      echo "端口：$PORT"
+      echo "到期：$(format_date "$EXPIRE_AT")"
+      echo
+      echo "tg://proxy?server=$IP&port=$PORT&secret=$SECRET"
+      echo
+      echo "https://t.me/proxy?server=$IP&port=$PORT&secret=$SECRET"
+      echo
+      echo "----------------------------------------"
+      echo
+    } >> "$OUT"
+  done
+
+  green "已导出全部链接：$OUT"
+}
+
+export_customers(){
+  ensure_dirs
+  OUT="$EXPORT_DIR/customers.csv"
+  echo "ID,客户名称,TG账号,备注,端口,状态,已用GB,限制GB,到期时间,代理链接" > "$OUT"
+
+  for FILE in "$NODE_DIR"/node-*.conf; do
+    [ ! -f "$FILE" ] && continue
+    . "$FILE"
+    CUSTOMER="${CUSTOMER:-未填写}"
+    TG_USER="${TG_USER:-未填写}"
+    REMARK="${REMARK:-}"
+    STATUS=$(normalize_status "${STATUS:-ACTIVE}")
+    USED_GB=$(bytes_to_gb "${USED_BYTES:-0}")
+    IP_NOW=$(get_ip)
+    [ -n "$IP_NOW" ] && IP="$IP_NOW"
+    LINK="tg://proxy?server=$IP&port=$PORT&secret=$SECRET"
+
+    echo "\"$ID\",\"$CUSTOMER\",\"$TG_USER\",\"$REMARK\",\"$PORT\",\"$STATUS\",\"$USED_GB\",\"$LIMIT_GB\",\"$(format_date "$EXPIRE_AT")\",\"$LINK\"" >> "$OUT"
+  done
+
+  green "已导出客户清单：$OUT"
+}
+
+traffic_rank(){
+  echo
+  printf "%-5s %-14s %-16s %-8s %-14s\n" "ID" "客户" "TG账号" "状态" "流量GB"
+  echo "----------------------------------------------------------------------------"
+
+  TMP=$(mktemp)
+  for FILE in "$NODE_DIR"/node-*.conf; do
+    [ ! -f "$FILE" ] && continue
+    . "$FILE"
+    USED_BYTES="${USED_BYTES:-0}"
+    echo "$USED_BYTES|$ID|${CUSTOMER:-未填写}|${TG_USER:-未填写}|$(normalize_status "${STATUS:-ACTIVE}")|$(bytes_to_gb "$USED_BYTES")/${LIMIT_GB}GB" >> "$TMP"
+  done
+
+  sort -t'|' -nr "$TMP" | while IFS='|' read -r _ ID CUSTOMER TG_USER STATUS TRAFFIC; do
+    printf "%-5s %-14s %-16s %-8s %-14s\n" "$ID" "$CUSTOMER" "$TG_USER" "$STATUS" "$TRAFFIC"
+  done
+
+  rm -f "$TMP"
+}
+
+check_nodes(){
+  ensure_dirs
+  NOW=$(date +%s)
+
+  for FILE in "$NODE_DIR"/node-*.conf; do
+    [ ! -f "$FILE" ] && continue
+
+    . "$FILE"
+
+    CUSTOMER="${CUSTOMER:-未填写}"
+    TG_USER="${TG_USER:-未填写}"
+    REMARK="${REMARK:-}"
+    TAG="${TAG:-}"
+    STATUS=$(normalize_status "${STATUS:-ACTIVE}")
+    USED_BYTES="${USED_BYTES:-0}"
+    LAST_BYTES="${LAST_BYTES:-0}"
+    LIMIT_GB="${LIMIT_GB:-50}"
+    LIMIT_BYTES="${LIMIT_BYTES:-$(gb_to_bytes "$LIMIT_GB")}"
+
+    if [ "$STATUS" = "ACTIVE" ]; then
+      CURRENT_BYTES=$(container_traffic "$NAME")
+
+      if [ "$CURRENT_BYTES" -ge "$LAST_BYTES" ]; then
+        DELTA=$((CURRENT_BYTES - LAST_BYTES))
+      else
+        DELTA=$CURRENT_BYTES
+      fi
+
+      USED_BYTES=$((USED_BYTES + DELTA))
+      LAST_BYTES=$CURRENT_BYTES
+
+      if [ "$NOW" -ge "$EXPIRE_AT" ]; then
+        docker stop "$NAME" >/dev/null 2>&1 || true
+        STATUS="EXPIRED"
+      elif [ "$USED_BYTES" -ge "$LIMIT_BYTES" ]; then
+        docker stop "$NAME" >/dev/null 2>&1 || true
+        STATUS="LIMITED"
+      fi
+    fi
+
+    save_node
+  done
+}
+
+docker_status(){
+  docker ps -a --filter "name=mtproxy-node-"
+}
+
+health_check(){
+  check_nodes
+
+  echo "Docker:"
+  if systemctl is-active docker >/dev/null 2>&1; then
+    green "Docker 正常"
+  else
+    red "Docker 未运行"
+  fi
+
+  echo
+  echo "Cron:"
+  if systemctl is-active cron >/dev/null 2>&1; then
+    green "Cron 正常"
+  else
+    red "Cron 未运行"
+  fi
+
+  echo
+  echo "BBR:"
+  BBR=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
+  if [ "$BBR" = "bbr" ]; then
+    green "BBR 已开启"
+  else
+    yellow "BBR 未开启"
+  fi
+}
+
+dashboard_counts(){
+  TOTAL=0
+  ACTIVE_COUNT=0
+  EXPIRING=0
+  NOW=$(date +%s)
+  LIMIT_TIME=$((NOW + 7*86400))
+
+  for FILE in "$NODE_DIR"/node-*.conf; do
+    [ ! -f "$FILE" ] && continue
+    . "$FILE"
+    STATUS=$(normalize_status "${STATUS:-ACTIVE}")
+    TOTAL=$((TOTAL + 1))
+    [ "$STATUS" = "ACTIVE" ] && ACTIVE_COUNT=$((ACTIVE_COUNT + 1))
+    [ "$EXPIRE_AT" -le "$LIMIT_TIME" ] && EXPIRING=$((EXPIRING + 1))
+  done
+}
+
 menu(){
+  check_nodes >/dev/null 2>&1 || true
+  dashboard_counts
+
   clear
-  echo "===================================="
-  echo " Telegram MTProto 多节点管理脚本"
-  echo "===================================="
-  echo "1. 创建一条代理"
-  echo "2. 查看所有代理"
-  echo "3. 查看指定代理链接"
-  echo "4. 删除指定代理"
-  echo "5. 重启指定代理"
-  echo "6. 手动检查到期/流量"
-  echo "0. 退出"
-  echo "===================================="
+  echo "╔══════════════════════════════════════╗"
+  echo "║      MTProxy Enterprise Manager      ║"
+  echo "║                 $VERSION                 ║"
+  echo "╚══════════════════════════════════════╝"
+  echo
+  echo "在线节点：$ACTIVE_COUNT    总客户：$TOTAL    即将到期：$EXPIRING"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo
+  echo "[ 节点管理 ]"
+  echo " 1. 创建代理节点"
+  echo " 2. 批量创建节点"
+  echo " 3. 节点列表"
+  echo " 4. 节点详情"
+  echo
+  echo "[ 客户管理 ]"
+  echo " 5. 修改客户信息"
+  echo " 6. 修改到期时间"
+  echo " 7. 修改流量限制"
+  echo " 8. 节点续费"
+  echo
+  echo "[ 节点控制 ]"
+  echo " 9. 启用节点"
+  echo "10. 停用节点"
+  echo "11. 重启节点"
+  echo "12. 删除节点"
+  echo
+  echo "[ 数据中心 ]"
+  echo "13. 搜索客户"
+  echo "14. 即将到期客户"
+  echo "15. 导出全部链接"
+  echo "16. 导出客户清单"
+  echo "17. 流量排行"
+  echo
+  echo "[ 系统工具 ]"
+  echo "18. 健康检查"
+  echo "19. Docker 状态"
+  echo
+  echo " 0. 退出"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   read -rp "请选择: " num
 
   case "$num" in
-    1) create_node ;;
-    2) check_nodes; list_nodes ;;
-    3) check_nodes; show_one_node ;;
-    4) delete_node ;;
-    5) restart_node ;;
-    6) check_nodes; green "检查完成" ;;
+    1) create_node; pause ;;
+    2) batch_create_nodes; pause ;;
+    3) check_nodes; list_nodes; pause ;;
+    4) check_nodes; show_one_node; pause ;;
+    5) edit_customer; pause ;;
+    6) edit_expire; pause ;;
+    7) edit_limit; pause ;;
+    8) renew_node; pause ;;
+    9) enable_node; pause ;;
+    10) disable_node; pause ;;
+    11) restart_node; pause ;;
+    12) delete_node; pause ;;
+    13) search_customer; pause ;;
+    14) expiring_nodes; pause ;;
+    15) export_links; pause ;;
+    16) export_customers; pause ;;
+    17) traffic_rank; pause ;;
+    18) health_check; pause ;;
+    19) docker_status; pause ;;
     0) exit 0 ;;
-    *) red "输入错误" ;;
+    *) red "输入错误"; pause ;;
   esac
 }
 
@@ -368,9 +962,8 @@ if [ "$1" = "--check" ]; then
 fi
 
 check_root
+ensure_dirs
 
 while true; do
   menu
-  echo
-  read -rp "按回车返回菜单..."
 done
