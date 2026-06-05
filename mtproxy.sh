@@ -11,17 +11,22 @@ green(){ echo -e "\033[32m$1\033[0m"; }
 yellow(){ echo -e "\033[33m$1\033[0m"; }
 
 check_root(){
-  [ "$EUID" -ne 0 ] && red "请使用 root 运行" && exit 1
+  if [ "$EUID" -ne 0 ]; then
+    red "请使用 root 用户运行"
+    exit 1
+  fi
 }
 
 install_docker(){
   if ! command -v docker >/dev/null 2>&1; then
     yellow "正在安装 Docker..."
     apt update
-    apt install -y ca-certificates curl gnupg lsb-release
+    apt install -y ca-certificates curl gnupg lsb-release openssl
     curl -fsSL https://get.docker.com | bash
     systemctl enable docker
     systemctl start docker
+  else
+    green "Docker 已安装"
   fi
 }
 
@@ -56,6 +61,8 @@ EOF
 
   docker rm -f "$NAME" >/dev/null 2>&1 || true
 
+  yellow "正在启动 MTProxy..."
+
   docker run -d \
     --name "$NAME" \
     --restart unless-stopped \
@@ -66,7 +73,7 @@ EOF
 
   open_firewall "$PORT"
 
-  green "MTProto 代理安装完成"
+  green "MTProxy 安装完成"
   echo
   show_link
 }
@@ -78,8 +85,11 @@ show_link(){
   fi
 
   source "$CONF"
+
   IP_NOW=$(get_ip)
-  [ -n "$IP_NOW" ] && IP="$IP_NOW"
+  if [ -n "$IP_NOW" ]; then
+    IP="$IP_NOW"
+  fi
 
   echo "服务器 IP: $IP"
   echo "端口: $PORT"
@@ -102,7 +112,7 @@ logs_mtproxy(){
 
 restart_mtproxy(){
   docker restart "$NAME"
-  green "已重启"
+  green "MTProxy 已重启"
 }
 
 uninstall_mtproxy(){
@@ -124,6 +134,7 @@ menu(){
   echo "6. 删除 MTProxy"
   echo "0. 退出"
   echo "=============================="
+
   read -rp "请选择: " num
 
   case "$num" in
@@ -139,6 +150,7 @@ menu(){
 }
 
 check_root
+
 while true; do
   menu
   echo
