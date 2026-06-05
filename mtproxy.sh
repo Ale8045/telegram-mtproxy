@@ -6,7 +6,7 @@ EXPORT_DIR="$BASE_DIR/exports"
 BACKUP_DIR="$BASE_DIR/backups"
 BIN_PATH="/usr/local/bin/mtproxy-manager"
 IMAGE="telegrammessenger/proxy:latest"
-VERSION="v2.4"
+VERSION="v2.6-fixed"
 SCRIPT_URL="https://raw.githubusercontent.com/Ale8045/telegram-mtproxy/main/mtproxy.sh"
 
 red(){ echo -e "\033[31m$1\033[0m"; }
@@ -36,6 +36,11 @@ get_ip(){
 
 ensure_dirs(){
   mkdir -p "$BASE_DIR" "$NODE_DIR" "$EXPORT_DIR" "$BACKUP_DIR"
+}
+
+
+file_id_from_path(){
+  basename "$1" | sed 's/node-\([0-9]*\).conf/\1/'
 }
 
 node_file(){
@@ -106,6 +111,24 @@ open_firewall(){
     firewall-cmd --permanent --add-port="$PORT"/tcp >/dev/null 2>&1 || true
     firewall-cmd --reload >/dev/null 2>&1 || true
   fi
+}
+
+
+auto_install_shortcut(){
+  ensure_dirs
+  mkdir -p /usr/local/bin
+
+  if [ -f "$0" ] && grep -q "MTProxy Enterprise Manager" "$0" 2>/dev/null; then
+    cp "$0" "$BIN_PATH" 2>/dev/null || true
+  elif [ -f "./mtproxy.sh" ] && grep -q "MTProxy Enterprise Manager" "./mtproxy.sh" 2>/dev/null; then
+    cp "./mtproxy.sh" "$BIN_PATH" 2>/dev/null || true
+  else
+    curl -fsSL "$SCRIPT_URL" -o "$BIN_PATH" 2>/dev/null || true
+  fi
+
+  chmod +x "$BIN_PATH" 2>/dev/null || true
+  ln -sf "$BIN_PATH" /usr/local/bin/mtp 2>/dev/null || true
+  chmod +x /usr/local/bin/mtp 2>/dev/null || true
 }
 
 install_cron(){
@@ -238,10 +261,12 @@ format_date(){
 }
 
 load_node(){
-  ID="$1"
-  FILE=$(node_file "$ID")
+  REQ_ID="$1"
+  ID="$REQ_ID"
+  FILE=$(node_file "$REQ_ID")
   [ ! -f "$FILE" ] && red "节点不存在" && return 1
   . "$FILE"
+  ID="$REQ_ID"
 
   CUSTOMER="${CUSTOMER:-未填写}"
   TG_USER="${TG_USER:-未填写}"
@@ -456,29 +481,101 @@ create_node(){
 batch_create_nodes(){
   prepare_env
 
+  clear
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "批量创建节点 - 第 1 步：数量设置"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   read -rp "批量创建数量: " COUNT
   [ -z "$COUNT" ] && red "数量不能为空" && return
+  if ! echo "$COUNT" | grep -Eq '^[0-9]+$'; then
+    red "数量必须是数字"
+    return
+  fi
 
+  echo
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "批量创建节点 - 第 2 步：客户信息"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  read -rp "客户名前缀 [默认 客户]: " CUSTOMER_PREFIX
+  CUSTOMER_PREFIX=${CUSTOMER_PREFIX:-客户}
+
+  read -rp "统一备注 [默认 批量创建]: " BATCH_REMARK
+  BATCH_REMARK=${BATCH_REMARK:-批量创建}
+
+  echo
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "批量创建节点 - 第 3 步：端口设置"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "1. 自动随机端口"
+  echo "2. 手动输入起始端口"
+  read -rp "请选择 [默认 1]: " PORT_MODE
+  PORT_MODE=${PORT_MODE:-1}
+
+  if [ "$PORT_MODE" = "2" ]; then
+    while true; do
+      read -rp "请输入起始端口: " START_PORT
+      if [ -z "$START_PORT" ]; then
+        red "起始端口不能为空"
+        continue
+      fi
+      if ! echo "$START_PORT" | grep -Eq '^[0-9]+$'; then
+        red "端口必须是数字"
+        continue
+      fi
+      if [ "$START_PORT" -lt 1 ] || [ "$START_PORT" -gt 65535 ]; then
+        red "端口范围必须是 1-65535"
+        continue
+      fi
+      break
+    done
+    PORT_PREVIEW="$START_PORT 起连续端口，遇到占用自动跳过"
+  else
+    PORT_PREVIEW="自动随机"
+  fi
+
+  echo
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "批量创建节点 - 第 4 步：套餐信息"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   read -rp "统一到期天数 [默认 30]: " DAYS
   DAYS=${DAYS:-30}
 
   read -rp "统一流量限制 GB [默认 50]: " LIMIT_GB
   LIMIT_GB=${LIMIT_GB:-50}
 
-  read -rp "频道 TAG，没有就回车: " TAG
+  TAG=""
 
-  read -rp "端口：1 自动随机 / 2 手动输入起始端口 [默认 1]: " PORT_MODE
-  PORT_MODE=${PORT_MODE:-1}
-
-  if [ "$PORT_MODE" = "2" ]; then
-    read -rp "请输入起始端口: " START_PORT
+  echo
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "批量创建节点 - 第 5 步：确认创建"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "创建数量: $COUNT"
+  echo "客户名前缀: $CUSTOMER_PREFIX"
+  echo "统一备注: $BATCH_REMARK"
+  echo "端口: $PORT_PREVIEW"
+  echo "到期天数: $DAYS 天"
+  echo "流量限制: ${LIMIT_GB}GB"
+  echo "频道 TAG: 暂不设置，创建后用 22.设置TAG"
+  echo
+  read -rp "确认批量创建？输入 y 继续: " CONFIRM
+  if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
+    yellow "已取消批量创建"
+    return
   fi
+
+  ensure_dirs
+  OUT="$EXPORT_DIR/batch_created_$(date +%Y%m%d_%H%M%S).txt"
+  : > "$OUT"
+
+  echo
+  yellow "开始批量创建..."
+  echo
 
   for i in $(seq 1 "$COUNT"); do
     ID=$(next_id)
-    CUSTOMER="客户-$ID"
+    CUSTOMER="${CUSTOMER_PREFIX}-${ID}"
     TG_USER="未填写"
-    REMARK="批量创建"
+    REMARK="$BATCH_REMARK"
     NAME="mtproxy-node-$ID"
 
     if [ "$PORT_MODE" = "2" ]; then
@@ -503,8 +600,25 @@ batch_create_nodes(){
     open_firewall "$PORT"
     save_node
 
-    green "已创建节点 ID: $ID 端口: $PORT"
+    echo "节点ID: $ID | 地址: $IP:$PORT | Secret: $SECRET"
+
+    {
+      echo "节点ID：$ID"
+      echo "客户：$CUSTOMER"
+      echo "备注：$REMARK"
+      echo "服务器地址：$IP:$PORT"
+      echo "Secret：$SECRET"
+      echo "Telegram链接：tg://proxy?server=$IP&port=$PORT&secret=$SECRET"
+      echo "网页链接：https://t.me/proxy?server=$IP&port=$PORT&secret=$SECRET"
+      echo "----------------------------------------"
+    } >> "$OUT"
   done
+
+  echo
+  green "批量创建完成"
+  yellow "IP:端口 和 Secret 已导出：$OUT"
+  echo
+  echo "说明：去 MTProxy Admin Bot 注册每条代理后，拿到 TAG，再用 22.设置TAG 填入对应节点。"
 }
 
 show_node(){
@@ -566,7 +680,9 @@ list_nodes(){
   echo "----------------------------------------------------------------------------"
 
   for FILE in "$NODE_DIR"/node-*.conf; do
+    FILE_ID=$(file_id_from_path "$FILE")
     . "$FILE"
+    ID="$FILE_ID"
     STATUS=$(normalize_status "${STATUS:-ACTIVE}")
     CUSTOMER="${CUSTOMER:-未填写}"
     TG_USER="${TG_USER:-未填写}"
@@ -756,7 +872,9 @@ search_customer(){
   FOUND=0
   for FILE in "$NODE_DIR"/node-*.conf; do
     [ ! -f "$FILE" ] && continue
+    FILE_ID=$(file_id_from_path "$FILE")
     . "$FILE"
+    ID="$FILE_ID"
     CUSTOMER="${CUSTOMER:-未填写}"
     TG_USER="${TG_USER:-未填写}"
     REMARK="${REMARK:-}"
@@ -785,7 +903,9 @@ expiring_nodes(){
   FOUND=0
   for FILE in "$NODE_DIR"/node-*.conf; do
     [ ! -f "$FILE" ] && continue
+    FILE_ID=$(file_id_from_path "$FILE")
     . "$FILE"
+    ID="$FILE_ID"
     STATUS=$(normalize_status "${STATUS:-ACTIVE}")
     CUSTOMER="${CUSTOMER:-未填写}"
     TG_USER="${TG_USER:-未填写}"
@@ -807,7 +927,9 @@ export_links(){
 
   for FILE in "$NODE_DIR"/node-*.conf; do
     [ ! -f "$FILE" ] && continue
+    FILE_ID=$(file_id_from_path "$FILE")
     . "$FILE"
+    ID="$FILE_ID"
     CUSTOMER="${CUSTOMER:-未填写}"
     TG_USER="${TG_USER:-未填写}"
     REMARK="${REMARK:-}"
@@ -844,7 +966,9 @@ export_customers(){
 
   for FILE in "$NODE_DIR"/node-*.conf; do
     [ ! -f "$FILE" ] && continue
+    FILE_ID=$(file_id_from_path "$FILE")
     . "$FILE"
+    ID="$FILE_ID"
     CUSTOMER="${CUSTOMER:-未填写}"
     TG_USER="${TG_USER:-未填写}"
     REMARK="${REMARK:-}"
@@ -868,7 +992,9 @@ traffic_rank(){
   TMP=$(mktemp)
   for FILE in "$NODE_DIR"/node-*.conf; do
     [ ! -f "$FILE" ] && continue
+    FILE_ID=$(file_id_from_path "$FILE")
     . "$FILE"
+    ID="$FILE_ID"
     USED_BYTES="${USED_BYTES:-0}"
     echo "$USED_BYTES|$ID|${CUSTOMER:-未填写}|${TG_USER:-未填写}|$(normalize_status "${STATUS:-ACTIVE}")|$(bytes_to_gb "$USED_BYTES")/${LIMIT_GB}GB" >> "$TMP"
   done
@@ -954,6 +1080,30 @@ set_node_tag(){
   show_node "$ID"
 }
 
+
+normalize_all_node_ids(){
+  ensure_dirs
+  for FILE in "$NODE_DIR"/node-*.conf; do
+    [ ! -f "$FILE" ] && continue
+    FILE_ID=$(file_id_from_path "$FILE")
+    . "$FILE"
+    ID="$FILE_ID"
+    CUSTOMER="${CUSTOMER:-未填写}"
+    TG_USER="${TG_USER:-未填写}"
+    REMARK="${REMARK:-}"
+    TAG="${TAG:-}"
+    STATUS=$(normalize_status "${STATUS:-ACTIVE}")
+    USED_BYTES="${USED_BYTES:-0}"
+    LAST_BYTES="${LAST_BYTES:-0}"
+    LIMIT_GB="${LIMIT_GB:-50}"
+    LIMIT_BYTES="${LIMIT_BYTES:-$(gb_to_bytes "$LIMIT_GB")}"
+    CREATED_AT="${CREATED_AT:-$(date +%s)}"
+    EXPIRE_AT="${EXPIRE_AT:-$((CREATED_AT + 30*86400))}"
+    IP="${IP:-$(get_ip)}"
+    save_node
+  done
+}
+
 install_shortcut(){
   install_cron
   green "快捷命令已安装：mtp"
@@ -1024,7 +1174,9 @@ dashboard_counts(){
 
   for FILE in "$NODE_DIR"/node-*.conf; do
     [ ! -f "$FILE" ] && continue
+    FILE_ID=$(file_id_from_path "$FILE")
     . "$FILE"
+    ID="$FILE_ID"
     STATUS=$(normalize_status "${STATUS:-ACTIVE}")
     TOTAL=$((TOTAL + 1))
     [ "$STATUS" = "ACTIVE" ] && ACTIVE_COUNT=$((ACTIVE_COUNT + 1))
@@ -1094,6 +1246,8 @@ fi
 
 check_root
 ensure_dirs
+auto_install_shortcut
+normalize_all_node_ids >/dev/null 2>&1 || true
 
 while true; do
   menu
