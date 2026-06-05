@@ -6,7 +6,7 @@ EXPORT_DIR="$BASE_DIR/exports"
 BACKUP_DIR="$BASE_DIR/backups"
 BIN_PATH="/usr/local/bin/mtproxy-manager"
 IMAGE="telegrammessenger/proxy:latest"
-VERSION="v2.0"
+VERSION="v2.1"
 
 red(){ echo -e "\033[31m$1\033[0m"; }
 green(){ echo -e "\033[32m$1\033[0m"; }
@@ -113,6 +113,8 @@ install_cron(){
   if [ -f "$0" ]; then
     cp "$0" "$BIN_PATH"
     chmod +x "$BIN_PATH"
+    ln -sf "$BIN_PATH" /usr/local/bin/mtp
+    chmod +x /usr/local/bin/mtp
   fi
 
   systemctl enable cron >/dev/null 2>&1 || true
@@ -836,6 +838,30 @@ check_nodes(){
   done
 }
 
+
+uninstall_manager(){
+  red "警告：此操作会删除所有 MTProxy 节点、配置、导出文件、定时任务和快捷命令。"
+  red "所有客户代理都会停止并删除。"
+  echo
+  read -rp "确认卸载请输入 DELETE: " CONFIRM
+
+  if [ "$CONFIRM" != "DELETE" ]; then
+    yellow "已取消卸载"
+    return
+  fi
+
+  docker ps -aq --filter "name=mtproxy-node-" | xargs -r docker rm -f >/dev/null 2>&1 || true
+
+  crontab -l 2>/dev/null | grep -v "mtproxy-manager --check" | crontab - 2>/dev/null || true
+
+  rm -f /usr/local/bin/mtp
+  rm -f "$BIN_PATH"
+  rm -rf "$BASE_DIR"
+
+  green "MTProxy Enterprise Manager 已卸载完成"
+  exit 0
+}
+
 docker_status(){
   docker ps -a --filter "name=mtproxy-node-"
 }
@@ -890,45 +916,25 @@ menu(){
   dashboard_counts
 
   clear
-  echo "╔══════════════════════════════════════╗"
-  echo "║      MTProxy Enterprise Manager      ║"
-  echo "║                 $VERSION                 ║"
-  echo "╚══════════════════════════════════════╝"
-  echo
-  echo "在线节点：$ACTIVE_COUNT    总客户：$TOTAL    即将到期：$EXPIRING"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo
-  echo "[ 节点管理 ]"
-  echo " 1. 创建代理节点"
-  echo " 2. 批量创建节点"
-  echo " 3. 节点列表"
-  echo " 4. 节点详情"
-  echo
-  echo "[ 客户管理 ]"
-  echo " 5. 修改客户信息"
-  echo " 6. 修改到期时间"
-  echo " 7. 修改流量限制"
-  echo " 8. 节点续费"
-  echo
-  echo "[ 节点控制 ]"
-  echo " 9. 启用节点"
-  echo "10. 停用节点"
-  echo "11. 重启节点"
-  echo "12. 删除节点"
-  echo
-  echo "[ 数据中心 ]"
-  echo "13. 搜索客户"
-  echo "14. 即将到期客户"
-  echo "15. 导出全部链接"
-  echo "16. 导出客户清单"
-  echo "17. 流量排行"
-  echo
-  echo "[ 系统工具 ]"
-  echo "18. 健康检查"
-  echo "19. Docker 状态"
-  echo
-  echo " 0. 退出"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "╔════════════════════════════════════╗"
+  echo "║  MTProxy Enterprise Manager $VERSION   ║"
+  echo "╚════════════════════════════════════╝"
+  echo "在线:$ACTIVE_COUNT  客户:$TOTAL  到期:$EXPIRING"
+  echo "────────────────────────────────────"
+  echo " 1.创建节点      2.批量创建"
+  echo " 3.节点列表      4.节点详情"
+  echo " 5.客户信息      6.修改时间"
+  echo " 7.修改流量      8.节点续费"
+  echo " 9.启用节点     10.停用节点"
+  echo "11.重启节点     12.删除节点"
+  echo "13.搜索客户     14.即将到期"
+  echo "15.导出链接     16.客户清单"
+  echo "17.流量排行     18.健康检查"
+  echo "19.Docker状态   20.卸载脚本"
+  echo " 0.退出"
+  echo "────────────────────────────────────"
+  echo "快捷命令：mtp"
+  echo "────────────────────────────────────"
   read -rp "请选择: " num
 
   case "$num" in
@@ -951,6 +957,7 @@ menu(){
     17) traffic_rank; pause ;;
     18) health_check; pause ;;
     19) docker_status; pause ;;
+    20) uninstall_manager; pause ;;
     0) exit 0 ;;
     *) red "输入错误"; pause ;;
   esac
