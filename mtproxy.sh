@@ -6,7 +6,8 @@ EXPORT_DIR="$BASE_DIR/exports"
 BACKUP_DIR="$BASE_DIR/backups"
 BIN_PATH="/usr/local/bin/mtproxy-manager"
 IMAGE="telegrammessenger/proxy:latest"
-VERSION="v2.1"
+VERSION="v2.4"
+SCRIPT_URL="https://raw.githubusercontent.com/Ale8045/telegram-mtproxy/main/mtproxy.sh"
 
 red(){ echo -e "\033[31m$1\033[0m"; }
 green(){ echo -e "\033[32m$1\033[0m"; }
@@ -110,12 +111,17 @@ open_firewall(){
 install_cron(){
   ensure_dirs
 
-  if [ -f "$0" ]; then
+  if [ -f "$0" ] && grep -q "MTProxy Enterprise Manager" "$0" 2>/dev/null; then
     cp "$0" "$BIN_PATH"
-    chmod +x "$BIN_PATH"
-    ln -sf "$BIN_PATH" /usr/local/bin/mtp
-    chmod +x /usr/local/bin/mtp
+  elif [ -f "./mtproxy.sh" ] && grep -q "MTProxy Enterprise Manager" "./mtproxy.sh" 2>/dev/null; then
+    cp "./mtproxy.sh" "$BIN_PATH"
+  else
+    curl -fsSL "$SCRIPT_URL" -o "$BIN_PATH"
   fi
+
+  chmod +x "$BIN_PATH"
+  ln -sf "$BIN_PATH" /usr/local/bin/mtp
+  chmod +x /usr/local/bin/mtp
 
   systemctl enable cron >/dev/null 2>&1 || true
   systemctl start cron >/dev/null 2>&1 || true
@@ -319,7 +325,7 @@ create_node_core(){
   NAME="mtproxy-node-$ID"
 
   if [ "$PORT_MODE" = "2" ]; then
-    read -rp "请输入端口: " PORT
+    PORT="$MANUAL_PORT"
   else
     PORT=$(random_port)
   fi
@@ -354,6 +360,10 @@ create_node(){
 
   ID=$(next_id)
 
+  clear
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "创建代理节点 - 第 1 步：客户信息"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   read -rp "客户名称: " CUSTOMER
   CUSTOMER=${CUSTOMER:-未填写}
 
@@ -362,22 +372,85 @@ create_node(){
 
   read -rp "节点备注: " REMARK
 
-  read -rp "端口：1 自动随机 / 2 手动输入 [默认 1]: " PORT_MODE
+  echo
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "创建代理节点 - 第 2 步：端口设置"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "1. 自动随机端口"
+  echo "2. 手动输入端口"
+  read -rp "请选择 [默认 1]: " PORT_MODE
   PORT_MODE=${PORT_MODE:-1}
 
+  if [ "$PORT_MODE" = "2" ]; then
+    while true; do
+      read -rp "请输入端口: " MANUAL_PORT
+      if [ -z "$MANUAL_PORT" ]; then
+        red "端口不能为空"
+        continue
+      fi
+      if ! echo "$MANUAL_PORT" | grep -Eq '^[0-9]+$'; then
+        red "端口必须是数字"
+        continue
+      fi
+      if [ "$MANUAL_PORT" -lt 1 ] || [ "$MANUAL_PORT" -gt 65535 ]; then
+        red "端口范围必须是 1-65535"
+        continue
+      fi
+      if port_in_use "$MANUAL_PORT"; then
+        yellow "端口 $MANUAL_PORT 已被占用，请重新输入"
+        continue
+      fi
+      break
+    done
+    PORT_PREVIEW="$MANUAL_PORT"
+  else
+    PORT_PREVIEW="自动随机"
+  fi
+
+  echo
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "创建代理节点 - 第 3 步：套餐信息"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   read -rp "到期天数 [默认 30]: " DAYS
   DAYS=${DAYS:-30}
 
   read -rp "流量限制 GB [默认 50]: " LIMIT_GB
   LIMIT_GB=${LIMIT_GB:-50}
 
-  read -rp "频道 TAG，没有就回车: " TAG
+  TAG=""
+
+  echo
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "创建代理节点 - 第 4 步：确认创建"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "客户名称: $CUSTOMER"
+  echo "TG账号: $TG_USER"
+  echo "备注: $REMARK"
+  echo "端口: $PORT_PREVIEW"
+  echo "到期天数: $DAYS 天"
+  echo "流量限制: ${LIMIT_GB}GB"
+  echo "频道 TAG: 暂未设置，创建成功后可用 22 设置"
+  echo
+  read -rp "确认创建？输入 y 继续: " CONFIRM
+  if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
+    yellow "已取消创建"
+    return
+  fi
 
   create_node_core "$ID"
 
   green "创建成功"
   echo
   show_node "$ID"
+  echo
+  yellow "下一步去 MTProxy Admin Bot 注册："
+  echo "1. 给 Bot 发送："
+  echo "$IP:$PORT"
+  echo
+  echo "2. Bot 问 Secret 时，发送："
+  echo "$SECRET"
+  echo
+  echo "3. Bot 返回 TAG 后，回到本脚本选择 22 设置节点 TAG"
 }
 
 batch_create_nodes(){
@@ -455,8 +528,19 @@ show_node(){
   echo
   echo "节点ID: $ID"
   echo "容器: $NAME"
+  echo "服务器: $IP"
   echo "端口: $PORT"
+  echo "Secret: $SECRET"
+  if [ -n "$TAG" ]; then
+    echo "频道 TAG: $TAG"
+  else
+    echo "频道 TAG: 未设置"
+  fi
   echo "状态: $STATUS / $STATUS_TEXT"
+  echo
+  yellow "MTProxy Admin Bot 注册信息："
+  echo "服务器地址: $IP:$PORT"
+  echo "Secret: $SECRET"
   echo
   echo "已用流量: ${USED_GB}GB / ${LIMIT_GB}GB"
   echo "到期时间: $EXPIRE_DATE"
@@ -737,6 +821,8 @@ export_links(){
       echo "备注：$REMARK"
       echo "状态：$STATUS"
       echo "端口：$PORT"
+      echo "Secret：$SECRET"
+      echo "Bot注册地址：$IP:$PORT"
       echo "到期：$(format_date "$EXPIRE_AT")"
       echo
       echo "tg://proxy?server=$IP&port=$PORT&secret=$SECRET"
@@ -754,7 +840,7 @@ export_links(){
 export_customers(){
   ensure_dirs
   OUT="$EXPORT_DIR/customers.csv"
-  echo "ID,客户名称,TG账号,备注,端口,状态,已用GB,限制GB,到期时间,代理链接" > "$OUT"
+  echo "ID,客户名称,TG账号,备注,端口,Secret,Bot注册地址,状态,已用GB,限制GB,到期时间,代理链接" > "$OUT"
 
   for FILE in "$NODE_DIR"/node-*.conf; do
     [ ! -f "$FILE" ] && continue
@@ -768,7 +854,7 @@ export_customers(){
     [ -n "$IP_NOW" ] && IP="$IP_NOW"
     LINK="tg://proxy?server=$IP&port=$PORT&secret=$SECRET"
 
-    echo "\"$ID\",\"$CUSTOMER\",\"$TG_USER\",\"$REMARK\",\"$PORT\",\"$STATUS\",\"$USED_GB\",\"$LIMIT_GB\",\"$(format_date "$EXPIRE_AT")\",\"$LINK\"" >> "$OUT"
+    echo "\"$ID\",\"$CUSTOMER\",\"$TG_USER\",\"$REMARK\",\"$PORT\",\"$SECRET\",\"$IP:$PORT\",\"$STATUS\",\"$USED_GB\",\"$LIMIT_GB\",\"$(format_date "$EXPIRE_AT")\",\"$LINK\"" >> "$OUT"
   done
 
   green "已导出客户清单：$OUT"
@@ -838,6 +924,41 @@ check_nodes(){
   done
 }
 
+
+
+
+set_node_tag(){
+  read -rp "请输入节点 ID: " ID
+  load_node "$ID" || return
+
+  echo "当前 TAG: ${TAG:-未设置}"
+  read -rp "请输入新的频道 TAG，清空请输入空格后回车: " NEW_TAG
+
+  if [ "$NEW_TAG" = " " ]; then
+    TAG=""
+  else
+    TAG="$NEW_TAG"
+  fi
+
+  yellow "正在重建容器以应用 TAG，端口和 Secret 不会改变..."
+  run_container
+
+  if [ "$STATUS" = "MANUAL" ]; then
+    docker stop "$NAME" >/dev/null 2>&1 || true
+  else
+    STATUS="ACTIVE"
+  fi
+
+  save_node
+  green "TAG 已更新"
+  show_node "$ID"
+}
+
+install_shortcut(){
+  install_cron
+  green "快捷命令已安装：mtp"
+  echo "以后直接输入 mtp 打开管理菜单"
+}
 
 uninstall_manager(){
   red "警告：此操作会删除所有 MTProxy 节点、配置、导出文件、定时任务和快捷命令。"
@@ -930,7 +1051,8 @@ menu(){
   echo "13.搜索客户     14.即将到期"
   echo "15.导出链接     16.客户清单"
   echo "17.流量排行     18.健康检查"
-  echo "19.Docker状态   20.卸载脚本"
+  echo "19.Docker状态   20.安装快捷"
+  echo "21.卸载脚本     22.设置TAG"
   echo " 0.退出"
   echo "────────────────────────────────────"
   echo "快捷命令：mtp"
@@ -957,7 +1079,9 @@ menu(){
     17) traffic_rank; pause ;;
     18) health_check; pause ;;
     19) docker_status; pause ;;
-    20) uninstall_manager; pause ;;
+    20) install_shortcut; pause ;;
+    21) uninstall_manager; pause ;;
+    22) set_node_tag; pause ;;
     0) exit 0 ;;
     *) red "输入错误"; pause ;;
   esac
