@@ -6,7 +6,7 @@ EXPORT_DIR="$BASE_DIR/exports"
 BACKUP_DIR="$BASE_DIR/backups"
 BIN_PATH="/usr/local/bin/mtproxy-manager"
 IMAGE="telegrammessenger/proxy:latest"
-VERSION="v2.6-fixed"
+VERSION="v2.7"
 SCRIPT_URL="https://raw.githubusercontent.com/Ale8045/telegram-mtproxy/main/mtproxy.sh"
 
 red(){ echo -e "\033[31m$1\033[0m"; }
@@ -265,6 +265,7 @@ load_node(){
   ID="$REQ_ID"
   FILE=$(node_file "$REQ_ID")
   [ ! -f "$FILE" ] && red "节点不存在" && return 1
+
   . "$FILE"
   ID="$REQ_ID"
 
@@ -507,7 +508,7 @@ batch_create_nodes(){
   echo "批量创建节点 - 第 3 步：端口设置"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo "1. 自动随机端口"
-  echo "2. 手动输入起始端口"
+  echo "2. 手动连续端口"
   read -rp "请选择 [默认 1]: " PORT_MODE
   PORT_MODE=${PORT_MODE:-1}
 
@@ -550,9 +551,9 @@ batch_create_nodes(){
   echo "批量创建节点 - 第 5 步：确认创建"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo "创建数量: $COUNT"
-  echo "客户名前缀: $CUSTOMER_PREFIX"
+  echo "客户前缀: $CUSTOMER_PREFIX"
   echo "统一备注: $BATCH_REMARK"
-  echo "端口: $PORT_PREVIEW"
+  echo "端口模式: $PORT_PREVIEW"
   echo "到期天数: $DAYS 天"
   echo "流量限制: ${LIMIT_GB}GB"
   echo "频道 TAG: 暂不设置，创建后用 22.设置TAG"
@@ -600,20 +601,22 @@ batch_create_nodes(){
     open_firewall "$PORT"
     save_node
 
-    echo "节点ID: $ID | 地址: $IP:$PORT | Secret: $SECRET"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "ID: $ID"
+    echo "$IP:$PORT"
+    echo "Secret: $SECRET"
 
     {
-      echo "节点ID：$ID"
-      echo "客户：$CUSTOMER"
-      echo "备注：$REMARK"
-      echo "服务器地址：$IP:$PORT"
-      echo "Secret：$SECRET"
-      echo "Telegram链接：tg://proxy?server=$IP&port=$PORT&secret=$SECRET"
-      echo "网页链接：https://t.me/proxy?server=$IP&port=$PORT&secret=$SECRET"
+      echo "ID: $ID"
+      echo "$IP:$PORT"
+      echo "Secret: $SECRET"
+      echo "tg://proxy?server=$IP&port=$PORT&secret=$SECRET"
+      echo "https://t.me/proxy?server=$IP&port=$PORT&secret=$SECRET"
       echo "----------------------------------------"
     } >> "$OUT"
   done
 
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo
   green "批量创建完成"
   yellow "IP:端口 和 Secret 已导出：$OUT"
@@ -1013,7 +1016,9 @@ check_nodes(){
   for FILE in "$NODE_DIR"/node-*.conf; do
     [ ! -f "$FILE" ] && continue
 
+    FILE_ID=$(file_id_from_path "$FILE")
     . "$FILE"
+    ID="$FILE_ID"
 
     CUSTOMER="${CUSTOMER:-未填写}"
     TG_USER="${TG_USER:-未填写}"
@@ -1049,8 +1054,6 @@ check_nodes(){
     save_node
   done
 }
-
-
 
 
 set_node_tag(){
@@ -1102,6 +1105,36 @@ normalize_all_node_ids(){
     IP="${IP:-$(get_ip)}"
     save_node
   done
+}
+
+
+update_script(){
+  yellow "正在从 GitHub 更新脚本..."
+
+  TMP_FILE="/tmp/mtproxy_update.sh"
+
+  curl -fsSL "$SCRIPT_URL" -o "$TMP_FILE" || {
+    red "更新失败：无法下载脚本"
+    return
+  }
+
+  if ! grep -q "MTProxy Enterprise Manager" "$TMP_FILE"; then
+    red "更新失败：下载内容不正确"
+    rm -f "$TMP_FILE"
+    return
+  fi
+
+  chmod +x "$TMP_FILE"
+  cp "$TMP_FILE" "$BIN_PATH"
+  chmod +x "$BIN_PATH"
+  ln -sf "$BIN_PATH" /usr/local/bin/mtp
+  chmod +x /usr/local/bin/mtp
+  rm -f "$TMP_FILE"
+
+  green "更新完成"
+  echo
+  yellow "请重新执行："
+  echo "mtp"
 }
 
 install_shortcut(){
@@ -1203,7 +1236,7 @@ menu(){
   echo "13.搜索客户     14.即将到期"
   echo "15.导出链接     16.客户清单"
   echo "17.流量排行     18.健康检查"
-  echo "19.Docker状态   20.安装快捷"
+  echo "19.Docker状态   20.更新脚本"
   echo "21.卸载脚本     22.设置TAG"
   echo " 0.退出"
   echo "────────────────────────────────────"
@@ -1231,7 +1264,7 @@ menu(){
     17) traffic_rank; pause ;;
     18) health_check; pause ;;
     19) docker_status; pause ;;
-    20) install_shortcut; pause ;;
+    20) update_script; pause ;;
     21) uninstall_manager; pause ;;
     22) set_node_tag; pause ;;
     0) exit 0 ;;
