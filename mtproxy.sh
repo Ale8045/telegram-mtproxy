@@ -6,7 +6,7 @@ EXPORT_DIR="$BASE_DIR/exports"
 BACKUP_DIR="$BASE_DIR/backups"
 BIN_PATH="/usr/local/bin/mtproxy-manager"
 IMAGE="telegrammessenger/proxy:latest"
-VERSION="v3.0-fast"
+VERSION="v3.3-cleanup"
 SCRIPT_URL="https://raw.githubusercontent.com/Ale8045/telegram-mtproxy/main/mtproxy.sh"
 
 red(){ echo -e "\033[31m$1\033[0m"; }
@@ -38,6 +38,12 @@ ensure_dirs(){
   mkdir -p "$BASE_DIR" "$NODE_DIR" "$EXPORT_DIR" "$BACKUP_DIR"
 }
 
+
+
+cleanup_old_exports(){
+  ensure_dirs
+  find "$EXPORT_DIR" -type f -mtime +7 -delete >/dev/null 2>&1 || true
+}
 
 file_id_from_path(){
   basename "$1" | sed 's/node-\([0-9]*\).conf/\1/'
@@ -71,28 +77,72 @@ EOF
 install_base(){
   ensure_dirs
 
-  apt update || {
-    yellow "APT 源异常，正在尝试修复..."
+  yellow "正在检查系统依赖..."
+
+  if ! timeout 180 apt update; then
+    yellow "APT 源异常或超时，正在尝试修复..."
     fix_debian_sources
     apt clean
-    apt update
-  }
+    timeout 180 apt update || {
+      red "APT 更新失败，请检查服务器软件源或网络。"
+      exit 1
+    }
+  fi
 
-  apt install -y curl ca-certificates openssl cron ufw iproute2 coreutils
+  timeout 300 apt install -y curl ca-certificates openssl cron ufw iproute2 coreutils || {
+    red "基础依赖安装失败，请检查 APT 源或网络。"
+    exit 1
+  }
 }
 
 install_docker(){
   if command -v docker >/dev/null 2>&1; then
-    green "Docker 已安装"
+    green "Docker 已安装：$(docker -v 2>/dev/null)"
     systemctl enable docker >/dev/null 2>&1 || true
     systemctl start docker >/dev/null 2>&1 || true
     return
   fi
 
-  yellow "正在安装 Docker..."
-  curl -fsSL https://get.docker.com | bash
-  systemctl enable docker >/dev/null 2>&1 || true
-  systemctl start docker >/dev/null 2>&1 || true
+  yellow "未检测到 Docker，开始安装..."
+  yellow "如果服务器网络较慢，最多等待 5 分钟，不会无限卡住。"
+
+  if command -v apt >/dev/null 2>&1; then
+    yellow "正在尝试使用系统源安装 docker.io..."
+
+    if timeout 300 bash -c 'DEBIAN_FRONTEND=noninteractive apt install -y docker.io >/tmp/mtproxy_docker_install.log 2>&1'; then
+      systemctl enable docker >/dev/null 2>&1 || true
+      systemctl start docker >/dev/null 2>&1 || true
+
+      if command -v docker >/dev/null 2>&1; then
+        green "Docker 安装成功：$(docker -v 2>/dev/null)"
+        return
+      fi
+    else
+      yellow "系统源安装 Docker 失败或超时，准备尝试官方安装脚本..."
+    fi
+  fi
+
+  yellow "正在使用 Docker 官方脚本安装..."
+  if timeout 300 bash -c 'curl -fsSL https://get.docker.com | bash >/tmp/mtproxy_docker_install.log 2>&1'; then
+    systemctl enable docker >/dev/null 2>&1 || true
+    systemctl start docker >/dev/null 2>&1 || true
+
+    if command -v docker >/dev/null 2>&1; then
+      green "Docker 安装成功：$(docker -v 2>/dev/null)"
+      return
+    fi
+  fi
+
+  red "Docker 安装失败或超时。"
+  yellow "你可以查看日志："
+  echo "cat /tmp/mtproxy_docker_install.log"
+  echo
+  yellow "也可以手动执行下面命令安装 Docker："
+  echo "apt update && apt install -y docker.io"
+  echo "systemctl enable docker && systemctl start docker"
+  echo
+  red "Docker 安装完成后，请重新运行脚本。"
+  exit 1
 }
 
 enable_bbr(){
@@ -925,41 +975,69 @@ expiring_nodes(){
 
 export_links(){
   ensure_dirs
+  cleanup_old_exports
   OUT="$EXPORT_DIR/all_links.txt"
   : > "$OUT"
+
+  if ! ls "$NODE_DIR"/node-*.conf >/dev/null 2>&1; then
+    red "暂无代理节点"
+    return
+  fi
+
+  IP_NOW=$(get_ip)
+
+  clear
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "全部节点链接"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
   for FILE in "$NODE_DIR"/node-*.conf; do
     [ ! -f "$FILE" ] && continue
     FILE_ID=$(file_id_from_path "$FILE")
     . "$FILE"
     ID="$FILE_ID"
+    NAME="mtproxy-node-$FILE_ID"
     CUSTOMER="${CUSTOMER:-未填写}"
     TG_USER="${TG_USER:-未填写}"
     REMARK="${REMARK:-}"
     STATUS=$(normalize_status "${STATUS:-ACTIVE}")
-    IP_NOW=$(get_ip)
+
     [ -n "$IP_NOW" ] && IP="$IP_NOW"
 
+    TG_LINK="tg://proxy?server=$IP&port=$PORT&secret=$SECRET"
+    WEB_LINK="https://t.me/proxy?server=$IP&port=$PORT&secret=$SECRET"
+
+    echo
+    echo "ID: $ID"
+    echo "客户: $CUSTOMER"
+    echo "TG: $TG_USER"
+    echo "状态: $STATUS"
+    echo "地址: $IP:$PORT"
+    echo "Secret: $SECRET"
+    echo "Telegram链接:"
+    echo "$TG_LINK"
+    echo "网页链接:"
+    echo "$WEB_LINK"
+    echo "----------------------------------------"
+
     {
+      echo "ID：$ID"
       echo "客户：$CUSTOMER"
       echo "TG：$TG_USER"
       echo "备注：$REMARK"
       echo "状态：$STATUS"
-      echo "端口：$PORT"
+      echo "地址：$IP:$PORT"
       echo "Secret：$SECRET"
-      echo "Bot注册地址：$IP:$PORT"
-      echo "到期：$(format_date "$EXPIRE_AT")"
-      echo
-      echo "tg://proxy?server=$IP&port=$PORT&secret=$SECRET"
-      echo
-      echo "https://t.me/proxy?server=$IP&port=$PORT&secret=$SECRET"
-      echo
+      echo "Telegram链接：$TG_LINK"
+      echo "网页链接：$WEB_LINK"
       echo "----------------------------------------"
       echo
     } >> "$OUT"
   done
 
-  green "已导出全部链接：$OUT"
+  echo
+  green "已显示全部节点链接"
+  yellow "同时已保存到：$OUT"
 }
 
 export_customers(){
@@ -1239,7 +1317,7 @@ menu(){
   echo " 9.启用节点     10.停用节点"
   echo "11.重启节点     12.删除节点"
   echo "13.搜索客户     14.即将到期"
-  echo "15.导出链接     16.客户清单"
+  echo "15.查看链接     16.客户清单"
   echo "17.流量排行     18.健康检查"
   echo "19.Docker状态   20.更新脚本"
   echo "21.卸载脚本     22.设置TAG"
@@ -1284,6 +1362,7 @@ fi
 
 check_root
 ensure_dirs
+cleanup_old_exports
 auto_install_shortcut
 normalize_all_node_ids >/dev/null 2>&1 || true
 
