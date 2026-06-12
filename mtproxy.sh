@@ -6,7 +6,7 @@ EXPORT_DIR="$BASE_DIR/exports"
 BACKUP_DIR="$BASE_DIR/backups"
 BIN_PATH="/usr/local/bin/mtproxy-manager"
 IMAGE="telegrammessenger/proxy:latest"
-VERSION="v3.3-cleanup"
+VERSION="v3.3.1-cleanup-fix"
 SCRIPT_URL="https://raw.githubusercontent.com/Ale8045/telegram-mtproxy/main/mtproxy.sh"
 
 red(){ echo -e "\033[31m$1\033[0m"; }
@@ -38,12 +38,11 @@ ensure_dirs(){
   mkdir -p "$BASE_DIR" "$NODE_DIR" "$EXPORT_DIR" "$BACKUP_DIR"
 }
 
-
-
 cleanup_old_exports(){
-  ensure_dirs
+  mkdir -p "$EXPORT_DIR"
   find "$EXPORT_DIR" -type f -mtime +7 -delete >/dev/null 2>&1 || true
 }
+
 
 file_id_from_path(){
   basename "$1" | sed 's/node-\([0-9]*\).conf/\1/'
