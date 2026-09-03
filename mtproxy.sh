@@ -5,8 +5,9 @@ NODE_DIR="$BASE_DIR/nodes"
 EXPORT_DIR="$BASE_DIR/exports"
 BACKUP_DIR="$BASE_DIR/backups"
 BIN_PATH="/usr/local/bin/mtproxy-manager"
-IMAGE="telegrammessenger/proxy:latest"
-VERSION="v3.3.1-cleanup-fix"
+IMAGE="${MTPROXY_IMAGE:-telegrammessenger/proxy:latest}"
+IMAGE_REF_FILE="$BASE_DIR/image.ref"
+VERSION="v3.4.0-reliability"
 SCRIPT_URL="https://raw.githubusercontent.com/Ale8045/telegram-mtproxy/main/mtproxy.sh"
 
 red(){ echo -e "\033[31m$1\033[0m"; }
@@ -27,15 +28,18 @@ check_root(){
 }
 
 safe_value(){
-  echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\$/\\$/g; s/`/\\`/g'
 }
 
 get_ip(){
-  curl -4 -s https://api.ipify.org || curl -4 -s https://ifconfig.me || hostname -I | awk '{print $1}'
+  curl -4 -fsS --connect-timeout 5 --max-time 10 https://api.ipify.org \
+    || curl -4 -fsS --connect-timeout 5 --max-time 10 https://ifconfig.me \
+    || hostname -I | awk '{print $1}'
 }
 
 ensure_dirs(){
   mkdir -p "$BASE_DIR" "$NODE_DIR" "$EXPORT_DIR" "$BACKUP_DIR"
+  chmod 700 "$BASE_DIR" "$NODE_DIR" "$EXPORT_DIR" "$BACKUP_DIR" 2>/dev/null || true
 }
 
 cleanup_old_exports(){
@@ -52,40 +56,15 @@ node_file(){
   echo "$NODE_DIR/node-$1.conf"
 }
 
-fix_debian_sources(){
-  [ ! -f /etc/debian_version ] && return
-  VER=$(grep -oE '^[0-9]+' /etc/debian_version 2>/dev/null || true)
-
-  if [ "$VER" = "11" ]; then
-    cat > /etc/apt/sources.list <<'EOF'
-deb http://deb.debian.org/debian bullseye main contrib non-free
-deb http://deb.debian.org/debian bullseye-updates main contrib non-free
-deb http://security.debian.org/debian-security bullseye-security main contrib non-free
-EOF
-  elif [ "$VER" = "12" ]; then
-    cat > /etc/apt/sources.list <<'EOF'
-deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
-deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
-deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
-EOF
-  fi
-
-  rm -f /etc/apt/sources.list.d/xanmod*.list 2>/dev/null || true
-}
-
 install_base(){
   ensure_dirs
 
   yellow "正在检查系统依赖..."
 
   if ! timeout 180 apt update; then
-    yellow "APT 源异常或超时，正在尝试修复..."
-    fix_debian_sources
-    apt clean
-    timeout 180 apt update || {
-      red "APT 更新失败，请检查服务器软件源或网络。"
-      exit 1
-    }
+    red "APT 更新失败。为避免破坏现有软件源，脚本不会修改 /etc/apt/sources.list。"
+    yellow "请修复服务器的软件源或网络后再运行脚本。"
+    exit 1
   fi
 
   timeout 300 apt install -y curl ca-certificates openssl cron ufw iproute2 coreutils || {
@@ -162,17 +141,44 @@ open_firewall(){
   fi
 }
 
+is_positive_integer(){
+  [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+is_nonnegative_number(){
+  [[ "$1" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]]
+}
+
+install_manager_script(){
+  local tmp_file source_file
+  tmp_file=$(mktemp /tmp/mtproxy-manager.XXXXXX) || return 1
+
+  if [ -f "./mtproxy.sh" ] && grep -q "MTProxy Enterprise Manager" "./mtproxy.sh" 2>/dev/null; then
+    source_file="./mtproxy.sh"
+    cp "$source_file" "$tmp_file"
+  else
+    curl -fL --connect-timeout 15 --retry 3 --retry-delay 2 "$SCRIPT_URL" -o "$tmp_file" || {
+      rm -f "$tmp_file"
+      return 1
+    }
+  fi
+
+  sed -i 's/\r$//' "$tmp_file"
+  if ! grep -q "MTProxy Enterprise Manager" "$tmp_file" || ! bash -n "$tmp_file"; then
+    rm -f "$tmp_file"
+    return 1
+  fi
+
+  install -m 0755 "$tmp_file" "$BIN_PATH"
+  rm -f "$tmp_file"
+}
+
 
 auto_install_shortcut(){
   ensure_dirs
   mkdir -p /usr/local/bin
 
-  # 优先使用当前目录真实脚本，避免 bash <(curl ...) 时复制到错误内容
-  if [ -f "./mtproxy.sh" ] && grep -q "MTProxy Enterprise Manager" "./mtproxy.sh" 2>/dev/null; then
-    cp "./mtproxy.sh" "$BIN_PATH" 2>/dev/null || true
-  else
-    curl -fsSL "$SCRIPT_URL" -o "$BIN_PATH" 2>/dev/null || true
-  fi
+  install_manager_script || return
 
   if [ -s "$BIN_PATH" ] && grep -q "MTProxy Enterprise Manager" "$BIN_PATH" 2>/dev/null; then
     chmod +x "$BIN_PATH" 2>/dev/null || true
@@ -185,11 +191,10 @@ install_cron(){
   ensure_dirs
   mkdir -p /usr/local/bin
 
-  if [ -f "./mtproxy.sh" ] && grep -q "MTProxy Enterprise Manager" "./mtproxy.sh" 2>/dev/null; then
-    cp "./mtproxy.sh" "$BIN_PATH"
-  else
-    curl -fsSL "$SCRIPT_URL" -o "$BIN_PATH"
-  fi
+  install_manager_script || {
+    red "安装管理脚本失败，当前版本未被覆盖。"
+    return 1
+  }
 
   chmod +x "$BIN_PATH"
   ln -sf "$BIN_PATH" /usr/local/bin/mtp
@@ -362,6 +367,7 @@ USED_BYTES=$USED_BYTES
 LAST_BYTES=$LAST_BYTES
 STATUS=$STATUS
 EOF
+  chmod 600 "$FILE"
 }
 
 proxy_link(){
@@ -376,13 +382,44 @@ web_link(){
   echo "https://t.me/proxy?server=$IP&port=$PORT&secret=$SECRET"
 }
 
+resolve_image(){
+  # 首次部署后固定到镜像摘要，避免 latest 在无提示情况下发生变化。
+  if [ -z "${MTPROXY_IMAGE:-}" ] && [ -s "$IMAGE_REF_FILE" ]; then
+    IMAGE=$(cat "$IMAGE_REF_FILE")
+    return 0
+  fi
+
+  if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    docker pull "$IMAGE" || return 1
+  fi
+
+  if [ -z "${MTPROXY_IMAGE:-}" ]; then
+    local digest
+    digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE" 2>/dev/null || true)
+    if [ -n "$digest" ]; then
+      printf '%s\n' "$digest" > "$IMAGE_REF_FILE"
+      chmod 600 "$IMAGE_REF_FILE"
+      IMAGE="$digest"
+    fi
+  fi
+}
+
 run_container(){
+  resolve_image || {
+    red "无法获取 MTProxy Docker 镜像：$IMAGE"
+    return 1
+  }
   docker rm -f "$NAME" >/dev/null 2>&1 || true
 
   if [ -n "$TAG" ]; then
     docker run -d \
       --name "$NAME" \
       --restart unless-stopped \
+      --memory="${MTPROXY_MEMORY_LIMIT:-256m}" \
+      --cpus="${MTPROXY_CPU_LIMIT:-1.0}" \
+      --pids-limit=256 \
+      --log-opt max-size=10m \
+      --log-opt max-file=3 \
       -p "$PORT:443" \
       -e SECRET="$SECRET" \
       -e TAG="$TAG" \
@@ -391,10 +428,17 @@ run_container(){
     docker run -d \
       --name "$NAME" \
       --restart unless-stopped \
+      --memory="${MTPROXY_MEMORY_LIMIT:-256m}" \
+      --cpus="${MTPROXY_CPU_LIMIT:-1.0}" \
+      --pids-limit=256 \
+      --log-opt max-size=10m \
+      --log-opt max-file=3 \
       -p "$PORT:443" \
       -e SECRET="$SECRET" \
       "$IMAGE"
   fi
+
+  docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null | grep -qx true
 }
 
 create_node_core(){
@@ -427,7 +471,10 @@ create_node_core(){
   LAST_BYTES=0
   STATUS="ACTIVE"
 
-  run_container
+  if ! run_container; then
+    red "容器启动失败，未保存节点配置。请执行：docker logs $NAME"
+    return 1
+  fi
   open_firewall "$PORT"
   save_node
 }
@@ -490,9 +537,17 @@ create_node(){
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   read -rp "到期天数 [默认 30]: " DAYS
   DAYS=${DAYS:-30}
+  if ! is_positive_integer "$DAYS"; then
+    red "到期天数必须是正整数"
+    return
+  fi
 
   read -rp "流量限制 GB [默认 50]: " LIMIT_GB
   LIMIT_GB=${LIMIT_GB:-50}
+  if ! is_nonnegative_number "$LIMIT_GB"; then
+    red "流量限制必须是非负数字"
+    return
+  fi
 
   TAG=""
 
@@ -543,6 +598,10 @@ batch_create_nodes(){
     red "数量必须是数字"
     return
   fi
+  if [ "$COUNT" -lt 1 ] || [ "$COUNT" -gt 50 ]; then
+    red "一次最多创建 50 个节点，避免资源耗尽"
+    return
+  fi
 
   echo
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -591,9 +650,17 @@ batch_create_nodes(){
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   read -rp "统一到期天数 [默认 30]: " DAYS
   DAYS=${DAYS:-30}
+  if ! is_positive_integer "$DAYS"; then
+    red "到期天数必须是正整数"
+    return
+  fi
 
   read -rp "统一流量限制 GB [默认 50]: " LIMIT_GB
   LIMIT_GB=${LIMIT_GB:-50}
+  if ! is_nonnegative_number "$LIMIT_GB"; then
+    red "流量限制必须是非负数字"
+    return
+  fi
 
   TAG=""
 
@@ -843,6 +910,7 @@ edit_expire(){
   echo "当前到期时间: $(format_date "$EXPIRE_AT")"
   read -rp "设置新的到期天数，从今天开始计算: " DAYS
   [ -z "$DAYS" ] && red "天数不能为空" && return
+  is_positive_integer "$DAYS" || { red "天数必须是正整数"; return; }
 
   EXPIRE_AT=$(($(date +%s) + DAYS * 86400))
 
@@ -864,6 +932,7 @@ edit_limit(){
   echo "当前流量限制: ${LIMIT_GB}GB"
   read -rp "新的流量限制 GB: " NEW_LIMIT_GB
   [ -z "$NEW_LIMIT_GB" ] && red "流量不能为空" && return
+  is_nonnegative_number "$NEW_LIMIT_GB" || { red "流量限制必须是非负数字"; return; }
 
   LIMIT_GB="$NEW_LIMIT_GB"
   LIMIT_BYTES=$(gb_to_bytes "$LIMIT_GB")
@@ -884,9 +953,11 @@ renew_node(){
 
   read -rp "增加天数 [默认 30]: " ADD_DAYS
   ADD_DAYS=${ADD_DAYS:-30}
+  is_positive_integer "$ADD_DAYS" || { red "增加天数必须是正整数"; return; }
 
   read -rp "增加流量 GB [默认 50]: " ADD_GB
   ADD_GB=${ADD_GB:-50}
+  is_nonnegative_number "$ADD_GB" || { red "增加流量必须是非负数字"; return; }
 
   NOW=$(date +%s)
 
@@ -1188,22 +1259,25 @@ normalize_all_node_ids(){
 update_script(){
   yellow "正在从 GitHub 更新脚本..."
 
-  TMP_FILE="/tmp/mtproxy_update.sh"
-
-  curl -fsSL "$SCRIPT_URL" -o "$TMP_FILE" || {
-    red "更新失败：无法下载脚本"
+  TMP_FILE=$(mktemp /tmp/mtproxy-update.XXXXXX) || {
+    red "更新失败：无法创建临时文件"
     return
   }
 
-  if ! grep -q "MTProxy Enterprise Manager" "$TMP_FILE"; then
-    red "更新失败：下载内容不正确"
+  curl -fL --connect-timeout 15 --retry 3 --retry-delay 2 "$SCRIPT_URL" -o "$TMP_FILE" || {
+    red "更新失败：无法下载脚本"
+    rm -f "$TMP_FILE"
+    return
+  }
+
+  sed -i 's/\r$//' "$TMP_FILE"
+  if ! grep -q "MTProxy Enterprise Manager" "$TMP_FILE" || ! bash -n "$TMP_FILE"; then
+    red "更新失败：下载内容不正确或语法校验失败"
     rm -f "$TMP_FILE"
     return
   fi
 
-  chmod +x "$TMP_FILE"
-  cp "$TMP_FILE" "$BIN_PATH"
-  chmod +x "$BIN_PATH"
+  install -m 0755 "$TMP_FILE" "$BIN_PATH"
   ln -sf "$BIN_PATH" /usr/local/bin/mtp
   chmod +x /usr/local/bin/mtp
 
